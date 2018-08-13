@@ -112,6 +112,9 @@ type SourceSpec struct {
 	// process defined in a container invocation.
 	Custom *corev1.Container `json:"custom,omitempty"`
 
+	// ConcourseResource represents a Concourse Resource.
+	ConcourseResource *ConcourseResource `json:"concourse_resource,omitempty"`
+
 	// SubPath specifies a path within the fetched source which should be
 	// built. This option makes parent directories *inaccessible* to the
 	// build steps. (The specific source type may, in fact, not even fetch
@@ -151,6 +154,54 @@ const (
 	// manifest-based protocol which enables incremental source upload.
 	GCSManifest GCSSourceType = "Manifest"
 )
+
+// ConcourseResource describes configuration necessary to run Concourse
+// Resource `check` and `get` inside Knative Build's source step.
+// It does not support the `resource`, `passed` or `trigger` keys.
+type ConcourseResource struct {
+	// Name represents the `name` of the resource found in a Concourse
+	// pipeline as part of the resource's configuration. As in Concourse,
+	// this name is used to create a subdirectory into which the resource
+	// is expected to place any created or downloaded files.
+	// See https://concourse-ci.org/resources.html#resource-name
+	Name string `json:"name"`
+
+	// Type represents a Resource `type`.
+	// See: https://concourse-ci.org/resources.html#resource-type
+	Type string `json:"type"`
+
+	// ImageRepository represents a Docker image repository reference.
+	// If provided, the image is fetched and `Type` is treated as name only.
+	// If not provided, `Type` is assumed to be one of the core resources
+	// supported by Concourse. For example, `type: git` will be treated as
+	// `image_repository: concourse/git-resource`. For the list of core
+	// resources, see: https://concourse-ci.org/included-resources.html
+	// If not provided and `Type` refers to a resource that is not one of
+	// core provided resources, the Build will error.
+	ImageRepository string `json:"image_repository,omitempty"`
+
+	// Source represents the `source` map found in a Concourse pipeline
+	// as part of resource's configuration.
+	// If present, it's passed to the resource at execution time.
+	// See: https://concourse-ci.org/resources.html#resource-source
+	Source map[string]string `json:"source,omitempty"`
+
+	// Params represents the `params` map found in a `get` step.
+	// If present, it's passed to the resource at execution time.
+	// See: https://concourse-ci.org/get-step.html#get-step-params
+	Params map[string]string `json:"params,omitempty"`
+
+	// VersionObject represents a manually-pinned `version` found in a `get` step.
+	// For example:
+	// 		A git version object:    `{ "ref": "61cebf" }`
+	// 		A docker version object: `{ "digest": "sha256:8c78cdb28dc47f6bafed15f7650fb8976c423425fa4a84d24ee62a5b1e2512cb" }
+	// If not present, `check` will behave according to the `latest` version policy.
+	// There is no support setting `latest` or `every`; these have no
+	// meaning in a Knative Build context. This is why the key has been
+	// named VersionObject/`version_object` instead of Version/`version`.
+	// See: https://concourse-ci.org/implementing-resources.html#check
+	VersionObject map[string]string `json:"version_object,omitempty"`
+}
 
 // BuildProvider defines a build execution implementation.
 type BuildProvider string

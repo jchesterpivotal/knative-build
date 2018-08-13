@@ -52,6 +52,7 @@ func TestParsing(t *testing.T) {
 		"testdata/git-subpath.yaml",
 		"testdata/gcs-archive.yaml",
 		"testdata/gcs-manifest.yaml",
+		"testdata/concourse-resource.yaml",
 	}
 
 	for _, in := range inputs {

@@ -29,11 +29,12 @@ import (
 	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/client-go/kubernetes"
 
-	v1alpha1 "github.com/knative/build/pkg/apis/build/v1alpha1"
+	"github.com/knative/build/pkg/apis/build/v1alpha1"
 	"github.com/knative/build/pkg/builder/validation"
 	"github.com/knative/build/pkg/credentials"
 	"github.com/knative/build/pkg/credentials/dockercreds"
 	"github.com/knative/build/pkg/credentials/gitcreds"
+	"encoding/json"
 )
 
 // These are effectively const, but Go doesn't have such an annotation.
@@ -94,6 +95,9 @@ const (
 	gitSource    = "git-source"
 	gcsSource    = "gcs-source"
 	customSource = "custom-source"
+	concourseResourceSource = "concourse-resource-source"
+	concourseCheckContainerPrefix = "concourse-check-container-"
+	concourseGetContainerPrefix = "concourse-get-container-"
 )
 
 var (
@@ -114,6 +118,7 @@ var (
 		gitSource:    containerToGit,
 		gcsSource:    containerToGCS,
 		customSource: containerToCustom,
+		concourseResourceSource: containerToConcourseResource,
 	}
 )
 
@@ -193,6 +198,70 @@ func containerToCustom(custom corev1.Container) (*v1alpha1.SourceSpec, error) {
 	c := custom.DeepCopy()
 	c.Name = ""
 	return &v1alpha1.SourceSpec{Custom: c}, nil
+}
+
+func concourseResourceToContainer(source *v1alpha1.ConcourseResource) (check *corev1.Container, get *corev1.Container, err error) {
+	workingDir := fmt.Sprintf("/workspace/%s", source.Name)
+
+	// Check container
+	var checkIn struct {
+		Source map[string]string `json:"source"`
+		Version map[string]string `json:"version"`
+	}
+	checkIn.Source = source.Source
+	checkIn.Version = source.VersionObject
+	checkInJson, err := json.Marshal(checkIn)
+	if err != nil {
+		return nil, nil, fmt.Errorf("could not marshall input for check: %s", err)
+	}
+
+	check = &corev1.Container{
+		Name: fmt.Sprintf("%s%s", concourseCheckContainerPrefix, source.Type),
+		Image: source.ImageRepository,
+		WorkingDir: workingDir,
+		Command: []string{"sh", "-c"},
+		Args: []string{
+			"/opt/resource/check",
+			string(checkInJson),
+			"|",
+			"tee",
+			fmt.Sprintf("%s/concourse-check-output.json", workingDir),
+		},
+	}
+
+	// Get container
+	var getIn struct {
+		Source map[string]string `json:"source"`
+		Version map[string]string `json:"version"`
+		Params map[string]string `json:"params"`
+	}
+	getIn.Source = source.Source
+	getIn.Version = source.VersionObject
+	getIn.Params = source.Params
+	getInJson, err := json.Marshal(getIn)
+	if err != nil {
+		return nil, nil, fmt.Errorf("could not marshall input for get: %s", err)
+	}
+
+	get = &corev1.Container{
+		Name: fmt.Sprintf("%s%s", concourseGetContainerPrefix, source.Type),
+		Image: source.ImageRepository,
+		WorkingDir: workingDir,
+		Command: []string{"sh", "-c"},
+		Args: []string{
+			"cat",
+			fmt.Sprintf("%s/concourse-check-output.json", workingDir),
+			"/opt/resource/in",
+			workingDir,
+			string(getInJson),
+		},
+	}
+
+	return
+}
+
+func containerToConcourseResource(corev1.Container) (*v1alpha1.SourceSpec, error) {
+	return &v1alpha1.SourceSpec{}, nil
 }
 
 func sourceToContainer(source *v1alpha1.SourceSpec) (*corev1.Container, error) {
@@ -281,11 +350,22 @@ func FromCRD(build *v1alpha1.Build, kubeclient kubernetes.Interface) (*corev1.Po
 	mounts := append([]corev1.VolumeMount{}, implicitVolumeMounts...)
 
 	if build.Spec.Source != nil {
-		scm, err = sourceToContainer(build.Spec.Source)
-		if err != nil {
-			return nil, err
+		// special case since Concourse separates check from get
+		if build.Spec.Source.ConcourseResource != nil {
+			check, get, err := concourseResourceToContainer(build.Spec.Source.ConcourseResource)
+			if err != nil {
+				return nil, err
+			}
+
+			setupContainers = append(setupContainers, *check)
+			setupContainers = append(setupContainers, *get)
+		} else {
+			scm, err = sourceToContainer(build.Spec.Source)
+			if err != nil {
+				return nil, err
+			}
+			setupContainers = append(setupContainers, *scm)
 		}
-		setupContainers = append(setupContainers, *scm)
 	}
 
 	// Add the implicit volume mounts to each step container.
@@ -469,6 +549,64 @@ func ToCRD(pod *corev1.Pod) (*v1alpha1.Build, error) {
 			scm.SubPath = subPath
 		}
 		steps = steps[1:]
+	}
+
+	// Special case for Concourse
+	if strings.HasPrefix(steps[0].Name, concourseCheckContainerPrefix) {
+		checkContainer := steps[0]
+		getContainer := steps[1]
+
+		resourceName := strings.TrimPrefix(checkContainer.WorkingDir, "/workspace/")
+		resourceType := strings.TrimPrefix(checkContainer.Name, concourseCheckContainerPrefix)
+
+		scr := &v1alpha1.ConcourseResource{
+			Name: resourceName,
+			Type: resourceType,
+			ImageRepository: checkContainer.Image,
+		}
+
+		checkInput := checkContainer.Args[1]
+		var checkIn struct {
+			Source map[string]string `json:"source"`
+			Version map[string]string `json:"version"`
+		}
+
+		err := json.Unmarshal([]byte(checkInput), &checkIn)
+		if err != nil {
+			return nil, fmt.Errorf("could not unmarshall args from check container: %s", err)
+		}
+
+		scr.Source = checkIn.Source
+		scr.VersionObject = checkIn.Version
+
+		getInput := getContainer.Args[4]
+		var getIn struct {
+			Source map[string]string `json:"source"`
+			Version map[string]string `json:"version"`
+			Params map[string]string `json:"params"`
+		}
+
+		err = json.Unmarshal([]byte(getInput), &getIn)
+		if err != nil {
+			return nil, fmt.Errorf("could not unmarshall args from get container: %s", err)
+		}
+
+		scr.Params = getIn.Params
+
+		// strip the check and get containers from the steps
+		steps = steps[2:]
+
+		spec := v1alpha1.BuildSpec{
+			Source: &v1alpha1.SourceSpec{
+				ConcourseResource: scr,
+			},
+			Steps:              steps,
+			ServiceAccountName: podSpec.ServiceAccountName,
+			Volumes:            volumes,
+			NodeSelector:       podSpec.NodeSelector,
+		}
+
+		return &v1alpha1.Build{Spec: spec}, nil
 	}
 
 	return &v1alpha1.Build{
